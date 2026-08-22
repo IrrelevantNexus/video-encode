@@ -1,0 +1,20 @@
+services:
+  video-encode:
+    build: .
+    container_name: video-encode
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ${MEDIA_ROOT_HOST_DIR:-/mnt/gaia}:/mnt/gaia
+    # NVIDIA NVENC hardware encoding (requires nvidia-container-toolkit on the host):
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # Intel Quick Sync (QSV) fallback.
+    devices:
+      - /dev/dri:/dev/dri
