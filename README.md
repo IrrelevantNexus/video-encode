@@ -23,6 +23,14 @@ and optionally asks Plex to do a targeted rescan of the affected folder.
   input/output mounts; a system that finds a file already locked skips it until the next
   scan. A lock older than `FILE_LOCK_STALE_SECONDS` is assumed abandoned (e.g. the owning
   system crashed) and is reclaimed.
+- If `EXTRACT_ARCHIVES=true` (default), release folders containing rar/zip/7z archives
+  (including headerless multi-volume rar sets with no first `.rar` volume) are extracted
+  in place before the video scan runs. Extraction is skipped if a video file is already
+  present in that folder. If extraction doesn't yield a video file, the archive is left
+  untouched and an error is logged; if it succeeds, the archive parts are removed once the
+  extracted video has been successfully encoded.
+- Directories named `Sample`/`Samples` (see `SAMPLE_DIR_NAMES`) are treated as preview clips
+  and are never scanned or encoded.
 - If configured, Plex is asked to run a **partial/targeted scan** of just the output
   subfolder (not a full library refresh) so it picks up the change quickly.
 - For each encode, the configured hardware order is attempted in sequence. A failed
@@ -85,6 +93,12 @@ Copy `.env.example` to `.env` and adjust. Key variables:
 | `AUDIO_CODEC` | `copy` | stream-copy audio; set e.g. `aac` to transcode |
 | `SCAN_INTERVAL_SECONDS` | `300` | how often to scan for new files |
 | `FILE_LOCK_STALE_SECONDS` | `21600` | reclaim a per-file lock left behind by a crashed run on another system |
+| `EXTRACT_ARCHIVES` | `true` | extract rar/zip/7z release archives in place before scanning for video |
+| `SAMPLE_DIR_NAMES` | `sample samples preview previews` | directory names (case-insensitive) excluded as preview clips |
+| `CPU_CORES` | — | docker-compose `cpuset`: host CPU cores the container may use, e.g. `0-15` |
+| `CPU_LIMIT` | — | docker-compose CPU time cap in core-equivalents, e.g. `16` |
+| `FFMPEG_NICE_LEVEL` | `15` | `nice` level for the ffmpeg process (higher = lower CPU priority) |
+| `FFMPEG_IONICE_CLASS` / `FFMPEG_IONICE_LEVEL` | `2` / `7` | `ionice` class/level for ffmpeg (lower I/O priority) |
 | `PLEX_URL` / `PLEX_TOKEN` / `PLEX_SECTION_ID` | — | all three required to enable Plex notification |
 | `PLEX_PATH_MAP_FROM` / `PLEX_PATH_MAP_TO` | — | remap this container's output path to the path Plex sees, if they differ |
 | `PLEX_METADATA_MIGRATION` | `false` | snapshot old Plex state and restore supported fields on the new item |

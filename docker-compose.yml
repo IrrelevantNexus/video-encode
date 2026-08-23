@@ -6,10 +6,15 @@ services:
     env_file:
       - .env
     volumes:
-      - ${MEDIA_ROOT_HOST_DIR:-/mnt/gaia}:/mnt/gaia
+      - ${MEDIA_ROOT_HOST_DIR}:${MEDIA_ROOT_HOST_DIR}
+    # Restrict which host CPU cores the container can use at all (true affinity), and cap
+    # the total CPU time it can consume, so it doesn't compete with other work on the host.
+    cpuset: "${CPU_CORES:-0-15}"
     # NVIDIA NVENC hardware encoding (requires nvidia-container-toolkit on the host):
     deploy:
       resources:
+        limits:
+          cpus: "${CPU_LIMIT:-16}"
         reservations:
           devices:
             - driver: nvidia

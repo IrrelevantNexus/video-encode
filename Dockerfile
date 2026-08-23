@@ -13,6 +13,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         util-linux \
         intel-media-va-driver-non-free \
         vainfo \
+        unrar \
+        p7zip-full \
     && rm -rf /var/lib/apt/lists/*
 
 COPY scripts/ /app/scripts/

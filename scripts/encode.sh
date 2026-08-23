@@ -24,6 +24,14 @@ PROGRESS_LOG_INTERVAL_SECONDS="${PROGRESS_LOG_INTERVAL_SECONDS:-30}"
 PLEX_METADATA_MIGRATION="${PLEX_METADATA_MIGRATION:-true}"
 # Cross-host lock so multiple systems can run against the same shared input/output mounts.
 FILE_LOCK_STALE_SECONDS="${FILE_LOCK_STALE_SECONDS:-21600}"
+# Compressed scene releases (rar/zip/7z) are extracted in place before scanning for video files.
+EXTRACT_ARCHIVES="${EXTRACT_ARCHIVES:-true}"
+# Directory names (case-insensitive) treated as preview/sample clips and excluded entirely.
+SAMPLE_DIR_NAMES="${SAMPLE_DIR_NAMES:-sample samples preview previews}"
+# Lower scheduling/I-O priority so ffmpeg yields to other work on the host under contention.
+FFMPEG_NICE_LEVEL="${FFMPEG_NICE_LEVEL:-15}"
+FFMPEG_IONICE_CLASS="${FFMPEG_IONICE_CLASS:-2}"   # 2=best-effort, 3=idle
+FFMPEG_IONICE_LEVEL="${FFMPEG_IONICE_LEVEL:-7}"   # 0-7, higher = lower priority (best-effort only)
 
 mkdir -p "$WORK_DIR"
 
@@ -80,6 +88,77 @@ acquire_file_lock() {
 
 release_file_lock() {
     rm -rf "$1" 2>/dev/null || true
+}
+
+# True if any path component of $1 (relative to INPUT_DIR) matches a configured sample-dir name.
+is_sample_dir() {
+    local dir="$1" rel seg name
+    rel="${dir#"$INPUT_DIR"/}"
+    local -a segments
+    IFS='/' read -ra segments <<< "$rel"
+    for seg in "${segments[@]}"; do
+        for name in $SAMPLE_DIR_NAMES; do
+            [[ "${seg,,}" == "${name,,}" ]] && return 0
+        done
+    done
+    return 1
+}
+
+# True if $1 (a directory) already has a video file directly in it (i.e. already extracted).
+dir_has_video() {
+    local dir="$1" ext
+    local -a existing
+    for ext in $VIDEO_EXTENSIONS; do
+        existing=("$dir"/*."$ext")
+        (( ${#existing[@]} > 0 )) && return 0
+    done
+    return 1
+}
+
+# Extracts compressed scene releases (rar/zip/7z, including headerless multi-volume rar sets
+# with no first .rar volume) so the normal encode pass can pick up the resulting video file.
+# On success, records the archive parts in a marker file so process_file can remove them once
+# the extracted video has been encoded; on failure the archives are left untouched for review.
+extract_release_archives() {
+    [[ "$EXTRACT_ARCHIVES" == "true" ]] || return 0
+    local dir entry lock_dir marker
+    local -a parts
+    while IFS= read -r -d '' dir; do
+        is_sample_dir "$dir" && continue
+        dir_has_video "$dir" && continue
+
+        entry=""
+        parts=("$dir"/*.[Rr][Aa][Rr] "$dir"/*.[Rr]00 "$dir"/*.[Zz][Ii][Pp] "$dir"/*.7[Zz] "$dir"/*.001)
+        (( ${#parts[@]} == 0 )) && continue
+        entry="${parts[0]}"
+
+        lock_dir="$dir/.video-encode-extract-lock"
+        if ! acquire_file_lock "$lock_dir"; then
+            echo "[encode] skipping extraction, locked by another system: $dir"
+            continue
+        fi
+
+        parts=("$dir"/*.[Rr][Aa][Rr] "$dir"/*.[Rr][0-9][0-9] "$dir"/*.[Zz][Ii][Pp] "$dir"/*.[Zz][0-9][0-9] "$dir"/*.7[Zz] "$dir"/*.[0-9][0-9][0-9])
+        echo "[encode] extracting compressed release: $entry"
+        case "${entry,,}" in
+            *.rar|*.r00)
+                unrar x -y -o+ "$entry" "$dir/" > "$WORK_DIR/extract.log" 2>&1
+                ;;
+            *)
+                7z x -y "$entry" -o"$dir" > "$WORK_DIR/extract.log" 2>&1
+                ;;
+        esac
+
+        if dir_has_video "$dir"; then
+            echo "[encode] extraction succeeded: $dir"
+            marker="$dir/.video-encode-archive-cleanup"
+            printf '%s\n' "${parts[@]}" > "$marker"
+        else
+            echo "[encode] ERROR: extraction produced no video file, leaving archive in place: $dir"
+            tail -n 20 "$WORK_DIR/extract.log" 2>/dev/null || true
+        fi
+        release_file_lock "$lock_dir"
+    done < <(find "$INPUT_DIR" -type f \( -iname '*.rar' -o -iname '*.r00' -o -iname '*.zip' -o -iname '*.7z' -o -iname '*.001' \) -printf '%h\0' | sort -zu)
 }
 
 get_duration() {
@@ -145,7 +224,9 @@ run_ffmpeg_with_progress() {
     progress_file=$(mktemp "$WORK_DIR/progress.XXXXXX")
     stderr_log=$(mktemp "$WORK_DIR/ffmpeg-stderr.XXXXXX")
 
-    ffmpeg "$@" -progress "$progress_file" -nostats 2> >(tee "$stderr_log" >&2) &
+    local -a ionice_args=(-c "$FFMPEG_IONICE_CLASS")
+    [[ "$FFMPEG_IONICE_CLASS" != "3" ]] && ionice_args+=(-n "$FFMPEG_IONICE_LEVEL")
+    nice -n "$FFMPEG_NICE_LEVEL" ionice "${ionice_args[@]}" ffmpeg "$@" -progress "$progress_file" -nostats 2> >(tee "$stderr_log" >&2) &
     local ffmpeg_pid=$!
 
     if [[ "$src_duration" -gt 0 ]] 2>/dev/null; then
@@ -289,6 +370,16 @@ process_file() {
     echo "[encode] success, removing original: $input"
     rm -f "$input"
 
+    local archive_marker="$(dirname "$input")/.video-encode-archive-cleanup"
+    if [[ -f "$archive_marker" ]]; then
+        echo "[encode] removing source compressed files for extracted release: $(dirname "$input")"
+        local archive_file
+        while IFS= read -r archive_file; do
+            [[ -n "$archive_file" ]] && rm -f "$archive_file"
+        done < "$archive_marker"
+        rm -f "$archive_marker"
+    fi
+
     bump_conversion_count
     /app/scripts/notify_plex.sh "$out_dir" || true
     if [[ "$PLEX_METADATA_MIGRATION" == "true" ]]; then
@@ -301,11 +392,17 @@ run_job() {
     echo "[encode] starting job: ${job_name} (input=${INPUT_DIR}, output=${OUTPUT_DIR}, Plex section=${PLEX_SECTION_ID})"
     shopt -s nullglob globstar nocaseglob
 
+    extract_release_archives
+
     local -a queue=()
     local ext f suffix base_name_lower
     for ext in $VIDEO_EXTENSIONS; do
         for f in "$INPUT_DIR"/**/*."$ext"; do
             [[ -f "$f" ]] || continue
+            if is_sample_dir "$(dirname "$f")"; then
+                echo "[encode] ignoring preview/sample file: $f"
+                continue
+            fi
             base_name_lower="${f##*/}"
             base_name_lower="${base_name_lower,,}"
             for suffix in $TEMP_FILE_SUFFIXES; do
