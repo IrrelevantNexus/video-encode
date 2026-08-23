@@ -31,6 +31,11 @@ and optionally asks Plex to do a targeted rescan of the affected folder.
   extracted video has been successfully encoded.
 - Directories named `Sample`/`Samples` (see `SAMPLE_DIR_NAMES`) are treated as preview clips
   and are never scanned or encoded.
+- If `DYNAMIC_AFFINITY=true` (default), before each file's encode starts the container samples
+  current host CPU idle time (over the cores it's allowed to use, e.g. via `CPU_CORES`) and
+  picks how many cores and what `nice` level to use for that one encode, so a busy host gets a
+  smaller/politer share and an idle host gets more. This is re-evaluated per file, not just once
+  at container startup.
 - If configured, Plex is asked to run a **partial/targeted scan** of just the output
   subfolder (not a full library refresh) so it picks up the change quickly.
 - For each encode, the configured hardware order is attempted in sequence. A failed
@@ -97,8 +102,11 @@ Copy `.env.example` to `.env` and adjust. Key variables:
 | `SAMPLE_DIR_NAMES` | `sample samples preview previews` | directory names (case-insensitive) excluded as preview clips |
 | `CPU_CORES` | — | docker-compose `cpuset`: host CPU cores the container may use, e.g. `0-15` |
 | `CPU_LIMIT` | — | docker-compose CPU time cap in core-equivalents, e.g. `16` |
-| `FFMPEG_NICE_LEVEL` | `15` | `nice` level for the ffmpeg process (higher = lower CPU priority) |
+| `FFMPEG_NICE_LEVEL` | `15` | baseline `nice` level for ffmpeg (higher = lower CPU priority) |
 | `FFMPEG_IONICE_CLASS` / `FFMPEG_IONICE_LEVEL` | `2` / `7` | `ionice` class/level for ffmpeg (lower I/O priority) |
+| `DYNAMIC_AFFINITY` | `true` | re-pick core count/niceness per file based on current host load |
+| `MIN_ENCODE_CORES` | `2` | floor on cores picked per file when the host is busy |
+| `MAX_ENCODE_CORES` | — | cap on cores picked per file even when the host is idle |
 | `PLEX_URL` / `PLEX_TOKEN` / `PLEX_SECTION_ID` | — | all three required to enable Plex notification |
 | `PLEX_PATH_MAP_FROM` / `PLEX_PATH_MAP_TO` | — | remap this container's output path to the path Plex sees, if they differ |
 | `PLEX_METADATA_MIGRATION` | `false` | snapshot old Plex state and restore supported fields on the new item |

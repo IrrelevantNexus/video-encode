@@ -32,6 +32,11 @@ SAMPLE_DIR_NAMES="${SAMPLE_DIR_NAMES:-sample samples preview previews}"
 FFMPEG_NICE_LEVEL="${FFMPEG_NICE_LEVEL:-15}"
 FFMPEG_IONICE_CLASS="${FFMPEG_IONICE_CLASS:-2}"   # 2=best-effort, 3=idle
 FFMPEG_IONICE_LEVEL="${FFMPEG_IONICE_LEVEL:-7}"   # 0-7, higher = lower priority (best-effort only)
+# Re-evaluate CPU core count/niceness for each file based on current host load, instead of a
+# fixed affinity for the whole container's lifetime.
+DYNAMIC_AFFINITY="${DYNAMIC_AFFINITY:-true}"
+MIN_ENCODE_CORES="${MIN_ENCODE_CORES:-2}"
+MAX_ENCODE_CORES="${MAX_ENCODE_CORES:-}"   # empty = no cap beyond the cores available to the container
 
 mkdir -p "$WORK_DIR"
 
@@ -211,6 +216,74 @@ encode_with_fallback() {
     return 1
 }
 
+# Average idle% over ~1s for the given space-separated list of CPU core numbers, using /proc/stat.
+sample_avg_idle_pct() {
+    local cores="$1" snap1 snap2
+    snap1=$(awk -v cores="$cores" '
+        BEGIN { n=split(cores,c," "); for (i=1;i<=n;i++) want["cpu" c[i]]=1 }
+        $1 in want { idle=$5+$6; total=0; for (f=2; f<=NF; f++) total+=$f; print idle, total }
+    ' /proc/stat 2>/dev/null)
+    sleep 1
+    snap2=$(awk -v cores="$cores" '
+        BEGIN { n=split(cores,c," "); for (i=1;i<=n;i++) want["cpu" c[i]]=1 }
+        $1 in want { idle=$5+$6; total=0; for (f=2; f<=NF; f++) total+=$f; print idle, total }
+    ' /proc/stat 2>/dev/null)
+    awk -v s1="$snap1" -v s2="$snap2" 'BEGIN {
+        n1=split(s1, a1, "\n"); n2=split(s2, a2, "\n");
+        di=0; dt=0
+        for (i=1;i<=n1 && i<=n2;i++) {
+            split(a1[i], p1, " "); split(a2[i], p2, " ")
+            di += (p2[1]-p1[1]); dt += (p2[2]-p1[2])
+        }
+        if (dt<=0) dt=1
+        pct = di*100/dt; if (pct<0) pct=0; if (pct>100) pct=100
+        printf "%d", pct
+    }'
+}
+
+# Picks how many CPU cores (and what nice level) this encode should use, based on current host
+# load across the cores actually available to this container. Sets ENCODE_CPU_LIST/ENCODE_NICE_LEVEL.
+compute_affinity() {
+    [[ "$DYNAMIC_AFFINITY" == "true" ]] || return 0
+    local allowed_list part start end n
+    allowed_list=$(taskset -pc $$ 2>/dev/null | awk -F': ' '{print $2}')
+    [[ -z "$allowed_list" ]] && allowed_list="0-$(( $(nproc) - 1 ))"
+
+    local -a cores=()
+    for part in ${allowed_list//,/ }; do
+        if [[ "$part" == *-* ]]; then
+            start="${part%-*}"; end="${part#*-}"
+            for (( n=start; n<=end; n++ )); do cores+=("$n"); done
+        else
+            cores+=("$part")
+        fi
+    done
+    (( ${#cores[@]} == 0 )) && cores=(0)
+    local total_avail=${#cores[@]}
+
+    local idle_pct
+    idle_pct=$(sample_avg_idle_pct "${cores[*]}")
+    [[ -z "$idle_pct" ]] && idle_pct=50
+
+    local want_cores
+    want_cores=$(( (total_avail * idle_pct + 50) / 100 ))
+    (( want_cores < MIN_ENCODE_CORES )) && want_cores=$MIN_ENCODE_CORES
+    (( want_cores > total_avail )) && want_cores=$total_avail
+    if [[ -n "$MAX_ENCODE_CORES" ]] && (( want_cores > MAX_ENCODE_CORES )); then
+        want_cores=$MAX_ENCODE_CORES
+    fi
+
+    local -a picked=("${cores[@]:0:$want_cores}")
+    ENCODE_CPU_LIST=$(IFS=,; echo "${picked[*]}")
+
+    # Low idle -> nice 19 (most polite); high idle -> the configured baseline (never more aggressive).
+    ENCODE_NICE_LEVEL=$(( 19 - (idle_pct * (19 - FFMPEG_NICE_LEVEL) / 100) ))
+    (( ENCODE_NICE_LEVEL < FFMPEG_NICE_LEVEL )) && ENCODE_NICE_LEVEL=$FFMPEG_NICE_LEVEL
+    (( ENCODE_NICE_LEVEL > 19 )) && ENCODE_NICE_LEVEL=19
+
+    echo "[encode] host idle ${idle_pct}% across ${total_avail} available core(s); using ${want_cores} core(s) [${ENCODE_CPU_LIST}], nice=${ENCODE_NICE_LEVEL}"
+}
+
 # Patterns seen when the source itself is damaged: decode errors are expected to carry over to the output.
 DECODE_ERROR_PATTERN='Invalid data found when processing input|Invalid NAL unit size|Error while decoding stream|error while decoding MB|is not allocated|co located POCs unavailable'
 
@@ -224,9 +297,14 @@ run_ffmpeg_with_progress() {
     progress_file=$(mktemp "$WORK_DIR/progress.XXXXXX")
     stderr_log=$(mktemp "$WORK_DIR/ffmpeg-stderr.XXXXXX")
 
+    local nice_level="${ENCODE_NICE_LEVEL:-$FFMPEG_NICE_LEVEL}"
+    local -a affinity_args=()
+    if [[ "$DYNAMIC_AFFINITY" == "true" && -n "${ENCODE_CPU_LIST:-}" ]]; then
+        affinity_args=(taskset --cpu-list "$ENCODE_CPU_LIST")
+    fi
     local -a ionice_args=(-c "$FFMPEG_IONICE_CLASS")
     [[ "$FFMPEG_IONICE_CLASS" != "3" ]] && ionice_args+=(-n "$FFMPEG_IONICE_LEVEL")
-    nice -n "$FFMPEG_NICE_LEVEL" ionice "${ionice_args[@]}" ffmpeg "$@" -progress "$progress_file" -nostats 2> >(tee "$stderr_log" >&2) &
+    nice -n "$nice_level" ionice "${ionice_args[@]}" "${affinity_args[@]}" ffmpeg "$@" -progress "$progress_file" -nostats 2> >(tee "$stderr_log" >&2) &
     local ffmpeg_pid=$!
 
     if [[ "$src_duration" -gt 0 ]] 2>/dev/null; then
@@ -304,6 +382,7 @@ process_file() {
     else
         mkdir -p "$out_dir"
         echo "[encode] encoding (fallback order: ${HW_ACCEL_ORDER}): $input -> $final_output"
+        compute_affinity
 
         local src_duration_precheck
         src_duration_precheck=$(get_duration "$input")
