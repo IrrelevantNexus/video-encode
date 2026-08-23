@@ -47,7 +47,7 @@ name|container_input|container_output|plex_section_id|plex_input_path|plex_outpu
 Example:
 
 ```text
-JOBS=TV|/mnt/gaia/Video/TV-Shows/Original|/mnt/gaia/Video/TV-Shows/Production|2|/share/GaiaVideo/TV-Shows/Original|/share/GaiaVideo/TV-Shows/Production;Movies|/mnt/gaia/Video/Movies/Original|/mnt/gaia/Video/Movies/Production|1|/share/GaiaVideo/Movies/Original|/share/GaiaVideo/Movies/Production
+JOBS=TV|/mnt/Video/TV-Shows/Original|/mnt/Video/TV-Shows/Production|2|/share/Video/TV-Shows/Original|/share/Video/TV-Shows/Production;Movies|/mnt/Video/Movies/Original|/mnt/Video/Movies/Production|1|/share/Video/Movies/Original|/share/Video/Movies/Production
 ```
 
 The `MEDIA_ROOT_HOST_DIR` mount must contain every container input/output path. Jobs run
