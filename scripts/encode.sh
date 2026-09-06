@@ -396,9 +396,9 @@ process_file() {
         # input audio/subtitle streams intact by default.
         local -a ffmpeg_common_args ffmpeg_recovery_args
         ffmpeg_common_args=(-y -hide_banner -loglevel warning -i "$input" \
-            -map 0:v:0 -map 0:a -map "0:s?" )
+            -map 0:v:0 -map "0:a?" -map "0:s?" )
         ffmpeg_recovery_args=(-y -hide_banner -loglevel warning -err_detect ignore_err -i "$input" \
-            -map 0:v:0 -map 0:a -map "0:s?" )
+            -map 0:v:0 -map "0:a?" -map "0:s?" )
         local used_recovery=false
         FFMPEG_SOURCE_HAD_DECODE_ERRORS=false
         if ! encode_with_fallback "$base_name" "$src_duration_precheck" "$tmp_output" false "${ffmpeg_common_args[@]}"; then
@@ -474,25 +474,31 @@ run_job() {
     extract_release_archives
 
     local -a queue=()
-    local ext f suffix base_name_lower
-    for ext in $VIDEO_EXTENSIONS; do
-        for f in "$INPUT_DIR"/**/*."$ext"; do
-            [[ -f "$f" ]] || continue
-            if is_sample_dir "$(dirname "$f")"; then
-                echo "[encode] ignoring preview/sample file: $f"
-                continue
-            fi
-            base_name_lower="${f##*/}"
-            base_name_lower="${base_name_lower,,}"
-            for suffix in $TEMP_FILE_SUFFIXES; do
-                if [[ "$base_name_lower" == *"${suffix,,}" ]]; then
-                    echo "[encode] ignoring temp/partial file: $f"
-                    continue 2
-                fi
-            done
-            queue+=("$f")
+    local f suffix ext base_name_lower discovered_count=0 is_video
+    while IFS= read -r -d '' f; do
+        (( discovered_count++ ))
+        if (( discovered_count % 500 == 0 )); then
+            echo "[encode] scan progress for ${job_name}: inspected ${discovered_count} file(s)"
+        fi
+        base_name_lower="${f##*/}"
+        base_name_lower="${base_name_lower,,}"
+        is_video=false
+        for ext in $VIDEO_EXTENSIONS; do
+            [[ "$base_name_lower" == *."${ext,,}" ]] && is_video=true && break
         done
-    done
+        [[ "$is_video" == true ]] || continue
+        if is_sample_dir "$(dirname "$f")"; then
+            echo "[encode] ignoring preview/sample file: $f"
+            continue
+        fi
+        for suffix in $TEMP_FILE_SUFFIXES; do
+            if [[ "$base_name_lower" == *"${suffix,,}" ]]; then
+                echo "[encode] ignoring temp/partial file: $f"
+                continue 2
+            fi
+        done
+        queue+=("$f")
+    done < <(find "$INPUT_DIR" -type f -print0)
 
     if [[ "${#queue[@]}" -eq 0 ]]; then
         echo "[encode] job ${job_name}: no files found to process"
