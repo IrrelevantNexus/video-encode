@@ -3,6 +3,10 @@ services:
     build: .
     container_name: video-encode
     restart: unless-stopped
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
     env_file:
       - .env
     volumes:
@@ -15,11 +19,6 @@ services:
       resources:
         limits:
           cpus: "${CPU_LIMIT:-16}"
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
     # Intel Quick Sync (QSV) fallback.
     devices:
       - /dev/dri:/dev/dri
