@@ -15,7 +15,7 @@ NVENC_CQ="${NVENC_CQ:-23}"              # nvenc constant quality
 NVENC_PRESET="${NVENC_PRESET:-p5}"
 QSV_QUALITY="${QSV_QUALITY:-23}"        # qsv global_quality
 AUDIO_CODEC="${AUDIO_CODEC:-copy}"      # copy | aac | ac3 ...
-VIDEO_EXTENSIONS="${VIDEO_EXTENSIONS:-mkv mp4 avi mov m4v ts wmv flv webm}"
+VIDEO_EXTENSIONS="${VIDEO_EXTENSIONS:-mkv mp4 mpg mpeg avi mov m4v ts wmv flv webm}"
 TEMP_FILE_SUFFIXES="${TEMP_FILE_SUFFIXES:-.part .tmp .partial .download}"
 STABLE_CHECK_SECONDS="${STABLE_CHECK_SECONDS:-30}"
 DURATION_TOLERANCE_SECONDS="${DURATION_TOLERANCE_SECONDS:-5}"
@@ -334,6 +334,39 @@ run_ffmpeg_with_progress() {
     return "$ffmpeg_exit"
 }
 
+move_companion_files() {
+    local source_dir="$1" destination_dir="$2" companion filename
+    while IFS= read -r -d '' companion; do
+        filename="${companion##*/}"
+        case "${filename,,}" in
+            *.nfo|*.jpg|*.jpeg|*.png|*.webp|*.gif|*.bmp|*.tif|*.tiff|*.avif) ;;
+            *) continue ;;
+        esac
+        if [[ -e "$destination_dir/$filename" || -L "$destination_dir/$filename" ]]; then
+            echo "[encode] companion destination exists, retaining source: $companion"
+            continue
+        fi
+        if ! mv -n -- "$companion" "$destination_dir/$filename"; then
+            echo "[encode] ERROR: could not move companion: $companion"
+            return 1
+        fi
+        if [[ -e "$companion" ]]; then
+            echo "[encode] companion destination appeared during move, retaining source: $companion"
+        else
+            echo "[encode] moved companion: $companion -> $destination_dir/$filename"
+        fi
+    done < <(find "$source_dir" -mindepth 1 -maxdepth 1 -type f -print0)
+}
+
+remove_empty_source_dirs() {
+    local directory="$1" input_root="${INPUT_DIR%/}"
+    while [[ "$directory" != "$input_root" && "$directory" == "$input_root/"* ]]; do
+        rmdir -- "$directory" 2>/dev/null || break
+        echo "[encode] removed empty directory: $directory"
+        directory="${directory%/*}"
+    done
+}
+
 process_file() {
     local input="$1"
     local rel_path rel_dir base_name out_dir final_output tmp_output migration_state
@@ -355,17 +388,36 @@ process_file() {
         echo "[encode] skipping, locked by another system (${owner_info:-unknown owner}): $input"
         return 0
     fi
-    trap 'release_file_lock "$lock_dir"' RETURN
+    local source_transferred=false
+    trap 'release_file_lock "$lock_dir"; if [[ "$source_transferred" == true ]]; then remove_empty_source_dirs "$(dirname "$input")"; fi' RETURN
+
+    local duration_failure_file="$(dirname "$input")/.video-encode-duration-failures.$(basename "$input")"
+    local duration_failures=0
+    if [[ -f "$duration_failure_file" ]]; then
+        read -r duration_failures < "$duration_failure_file" || return 1
+        if [[ ! "$duration_failures" =~ ^[0-9]+$ ]]; then
+            echo "[encode] ERROR: invalid duration failure counter: $duration_failure_file"
+            return 1
+        fi
+        duration_failures=$((10#$duration_failures))
+    fi
+    if (( duration_failures >= 2 )); then
+        echo "[encode] ignoring after ${duration_failures} duration-mismatch failures: $input"
+        return 0
+    fi
 
     if [[ -f "$final_output" ]]; then
         echo "[encode] output already exists, treating as already converted: $final_output"
+        move_companion_files "$(dirname "$input")" "$out_dir" || return 1
         if [[ "$PLEX_METADATA_MIGRATION" == "true" ]]; then
             python3 /app/scripts/migrate_plex_metadata.py snapshot "$input" "$migration_state" || true
             /app/scripts/notify_plex.sh "$out_dir" || true
             python3 /app/scripts/migrate_plex_metadata.py apply "$final_output" "$migration_state" || true
         fi
         echo "[encode] removing original because converted output exists: $input"
-        rm -f "$input"
+        rm -f "$input" || return 1
+        rm -f "$duration_failure_file"
+        source_transferred=true
         return 0
     fi
 
@@ -378,7 +430,7 @@ process_file() {
     if [[ "$SKIP_IF_ALREADY_HEVC" == "true" ]] && is_already_hevc "$input"; then
         echo "[encode] already HEVC, moving without re-encoding: $input"
         mkdir -p "$out_dir"
-        cp -f "$input" "$final_output"
+        cp -f "$input" "$final_output" || return 1
     else
         mkdir -p "$out_dir"
         echo "[encode] encoding (fallback order: ${HW_ACCEL_ORDER}): $input -> $final_output"
@@ -433,21 +485,30 @@ process_file() {
                     echo "[encode] WARNING: output duration mismatch (src=${src_duration}s out=${out_duration}s) on damaged source, keeping recovered output anyway"
                 else
                     echo "[encode] ERROR: output duration mismatch (src=${src_duration}s out=${out_duration}s), discarding output"
+                    duration_failures=$((duration_failures + 1))
+                    if ! printf '%s\n' "$duration_failures" > "$duration_failure_file"; then
+                        echo "[encode] ERROR: could not persist duration failure count: $duration_failure_file"
+                    fi
+                    echo "[encode] duration-mismatch failures: ${duration_failures}/2; ignored on future runs once limit is reached: $input"
                     rm -f "$tmp_output"
                     return 1
                 fi
             fi
         fi
 
-        mv -f "$tmp_output" "$final_output"
+        mv -f "$tmp_output" "$final_output" || return 1
     fi
+
+    move_companion_files "$(dirname "$input")" "$out_dir" || return 1
 
     if [[ "$PLEX_METADATA_MIGRATION" == "true" ]]; then
         python3 /app/scripts/migrate_plex_metadata.py snapshot "$input" "$migration_state" || true
     fi
 
     echo "[encode] success, removing original: $input"
-    rm -f "$input"
+    rm -f "$input" || return 1
+    rm -f "$duration_failure_file"
+    source_transferred=true
 
     local archive_marker="$(dirname "$input")/.video-encode-archive-cleanup"
     if [[ -f "$archive_marker" ]]; then
