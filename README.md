@@ -13,11 +13,16 @@ and optionally asks Plex to do a targeted rescan of the affected folder.
 - Encoding is done to a temporary `.part` file first, verified against the source (duration
   check, tolerance `DURATION_TOLERANCE_SECONDS`), then atomically renamed into place in
   `OUTPUT_DIR`. Output is always `.mkv` (best subtitle/chapter/metadata support).
+- If FFmpeg reports input decode errors, the temporary output is discarded and the source is
+  retained for review; a recovered but potentially incomplete encode is never treated as success.
 - All streams are mapped (`-map 0`) and file-level metadata/chapters are preserved
   (`-map_metadata 0 -map_chapters 0`). Audio/subtitles are stream-copied by default.
 - Only after the verified output exists is the original file in `INPUT_DIR` deleted.
 - If `SKIP_IF_ALREADY_HEVC=true` (default) and the source is already HEVC, the file is
   copied through unchanged instead of being re-encoded.
+- Input and output directories may be the same. An HEVC `.mkv` already at its output path is
+  left in place; a non-HEVC `.mkv` at that path is encoded to a temporary file and replaced
+  only after verification succeeds.
 - Before touching a file, a lock directory is created next to it (`.video-encode-lock.<name>`)
   so multiple systems can safely run this tool concurrently against the same shared
   input/output mounts; a system that finds a file already locked skips it until the next
@@ -56,7 +61,10 @@ JOBS=TV|/mnt/Video/TV-Shows/Original|/mnt/Video/TV-Shows/Production|2|/share/Vid
 ```
 
 The `MEDIA_ROOT_HOST_DIR` mount must contain every container input/output path. Jobs run
-sequentially, and queue/conversion messages include the job name.
+sequentially: each job's scan and queued files finish before the next job starts. Keep all
+jobs in the same `JOBS` value, separated by semicolons. The job name is only a log label, so
+distinct names (for example, `ZS-Original` and `ZS-Production`) make the logs easier to
+follow but are not required for execution.
 
 ## Important: Plex ratings/watched-status caveat
 

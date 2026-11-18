@@ -304,7 +304,11 @@ run_ffmpeg_with_progress() {
     fi
     local -a ionice_args=(-c "$FFMPEG_IONICE_CLASS")
     [[ "$FFMPEG_IONICE_CLASS" != "3" ]] && ionice_args+=(-n "$FFMPEG_IONICE_LEVEL")
-    nice -n "$nice_level" ionice "${ionice_args[@]}" "${affinity_args[@]}" ffmpeg "$@" -progress "$progress_file" -nostats 2> >(tee "$stderr_log" >&2) &
+    (
+        set -o pipefail
+        nice -n "$nice_level" ionice "${ionice_args[@]}" "${affinity_args[@]}" ffmpeg "$@" \
+            -progress "$progress_file" -nostats 2>&1 | tee "$stderr_log" >&2
+    ) &
     local ffmpeg_pid=$!
 
     if [[ "$src_duration" -gt 0 ]] 2>/dev/null; then
@@ -380,6 +384,8 @@ process_file() {
     final_output="$out_dir/${base_name}.mkv"
     tmp_output="$out_dir/.${base_name}.mkv.part"
     migration_state="$WORK_DIR/plex-metadata-$(printf '%s' "$input" | sha256sum | cut -d' ' -f1).json"
+    local same_file_output=false
+    [[ -e "$final_output" && "$input" -ef "$final_output" ]] && same_file_output=true
 
     local lock_dir="$(dirname "$input")/.video-encode-lock.$(basename "$input")"
     if ! acquire_file_lock "$lock_dir"; then
@@ -389,7 +395,7 @@ process_file() {
         return 0
     fi
     local source_transferred=false
-    trap 'release_file_lock "$lock_dir"; if [[ "$source_transferred" == true ]]; then remove_empty_source_dirs "$(dirname "$input")"; fi' RETURN
+    trap 'release_file_lock "$lock_dir"; if [[ "$source_transferred" == true ]]; then remove_empty_source_dirs "$(dirname "$input")"; fi; trap - RETURN' RETURN
 
     local duration_failure_file="$(dirname "$input")/.video-encode-duration-failures.$(basename "$input")"
     local duration_failures=0
@@ -406,7 +412,7 @@ process_file() {
         return 0
     fi
 
-    if [[ -f "$final_output" ]]; then
+    if [[ -f "$final_output" && "$same_file_output" != true ]]; then
         echo "[encode] output already exists, treating as already converted: $final_output"
         move_companion_files "$(dirname "$input")" "$out_dir" || return 1
         if [[ "$PLEX_METADATA_MIGRATION" == "true" ]]; then
@@ -418,6 +424,12 @@ process_file() {
         rm -f "$input" || return 1
         rm -f "$duration_failure_file"
         source_transferred=true
+        return 0
+    fi
+
+    if [[ "$same_file_output" == true && "$SKIP_IF_ALREADY_HEVC" == "true" ]] && is_already_hevc "$input"; then
+        echo "[encode] already HEVC at its output path, leaving in place: $input"
+        rm -f "$duration_failure_file"
         return 0
     fi
 
@@ -451,11 +463,9 @@ process_file() {
             -map 0:v:0 -map "0:a?" -map "0:s?" )
         ffmpeg_recovery_args=(-y -hide_banner -loglevel warning -err_detect ignore_err -i "$input" \
             -map 0:v:0 -map "0:a?" -map "0:s?" )
-        local used_recovery=false
         FFMPEG_SOURCE_HAD_DECODE_ERRORS=false
         if ! encode_with_fallback "$base_name" "$src_duration_precheck" "$tmp_output" false "${ffmpeg_common_args[@]}"; then
             echo "[encode] retrying with decode-error tolerance for damaged input: $input"
-            used_recovery=true
             if ! encode_with_fallback "$base_name" "$src_duration_precheck" "$tmp_output" true "${ffmpeg_recovery_args[@]}"; then
                 echo "[encode] ERROR: ffmpeg failed for $input"
                 rm -f "$tmp_output"
@@ -463,52 +473,56 @@ process_file() {
             fi
         fi
 
-        # A damaged source can legitimately decode to a shorter output; don't discard a recovered file for that.
+        if [[ "$FFMPEG_SOURCE_HAD_DECODE_ERRORS" == "true" ]]; then
+            echo "[encode] ERROR: FFmpeg reported decode errors for $input; discarding output and keeping the source for review"
+            rm -f "$tmp_output"
+            return 1
+        fi
+
         local src_duration out_duration diff
-        local source_damaged=false
-        [[ "$used_recovery" == "true" || "$FFMPEG_SOURCE_HAD_DECODE_ERRORS" == "true" ]] && source_damaged=true
         src_duration=$(get_duration "$input")
         out_duration=$(get_duration "$tmp_output")
         if [[ -z "$src_duration" || -z "$out_duration" ]]; then
-            if [[ "$source_damaged" == "true" ]]; then
-                echo "[encode] WARNING: could not verify duration for damaged source $input, keeping recovered output anyway"
-            else
-                echo "[encode] ERROR: could not verify duration for $input, discarding output"
-                rm -f "$tmp_output"
-                return 1
-            fi
+            echo "[encode] ERROR: could not verify duration for $input, discarding output"
+            rm -f "$tmp_output"
+            return 1
         else
             diff=$(( src_duration - out_duration ))
             diff=${diff#-}
             if (( diff > DURATION_TOLERANCE_SECONDS )); then
-                if [[ "$source_damaged" == "true" ]]; then
-                    echo "[encode] WARNING: output duration mismatch (src=${src_duration}s out=${out_duration}s) on damaged source, keeping recovered output anyway"
-                else
-                    echo "[encode] ERROR: output duration mismatch (src=${src_duration}s out=${out_duration}s), discarding output"
-                    duration_failures=$((duration_failures + 1))
-                    if ! printf '%s\n' "$duration_failures" > "$duration_failure_file"; then
-                        echo "[encode] ERROR: could not persist duration failure count: $duration_failure_file"
-                    fi
-                    echo "[encode] duration-mismatch failures: ${duration_failures}/2; ignored on future runs once limit is reached: $input"
-                    rm -f "$tmp_output"
-                    return 1
+                echo "[encode] ERROR: output duration mismatch (src=${src_duration}s out=${out_duration}s), discarding output"
+                duration_failures=$((duration_failures + 1))
+                if ! printf '%s\n' "$duration_failures" > "$duration_failure_file"; then
+                    echo "[encode] ERROR: could not persist duration failure count: $duration_failure_file"
                 fi
+                echo "[encode] duration-mismatch failures: ${duration_failures}/2; ignored on future runs once limit is reached: $input"
+                rm -f "$tmp_output"
+                return 1
             fi
         fi
 
+        if [[ "$same_file_output" == true && "$PLEX_METADATA_MIGRATION" == "true" ]]; then
+            python3 /app/scripts/migrate_plex_metadata.py snapshot "$input" "$migration_state" || true
+        fi
         mv -f "$tmp_output" "$final_output" || return 1
     fi
 
-    move_companion_files "$(dirname "$input")" "$out_dir" || return 1
+    if [[ "$same_file_output" != true ]]; then
+        move_companion_files "$(dirname "$input")" "$out_dir" || return 1
+    fi
 
-    if [[ "$PLEX_METADATA_MIGRATION" == "true" ]]; then
+    if [[ "$PLEX_METADATA_MIGRATION" == "true" && "$same_file_output" != true ]]; then
         python3 /app/scripts/migrate_plex_metadata.py snapshot "$input" "$migration_state" || true
     fi
 
-    echo "[encode] success, removing original: $input"
-    rm -f "$input" || return 1
+    if [[ "$same_file_output" == true ]]; then
+        echo "[encode] success, replaced source with verified output: $input"
+    else
+        echo "[encode] success, removing original: $input"
+        rm -f "$input" || return 1
+        source_transferred=true
+    fi
     rm -f "$duration_failure_file"
-    source_transferred=true
 
     local archive_marker="$(dirname "$input")/.video-encode-archive-cleanup"
     if [[ -f "$archive_marker" ]]; then
@@ -591,6 +605,7 @@ run_configured_jobs() {
         PLEX_PATH_MAP_TO="$plex_output"
         export PLEX_SECTION_ID PLEX_INPUT_PATH_MAP_FROM PLEX_INPUT_PATH_MAP_TO PLEX_PATH_MAP_FROM PLEX_PATH_MAP_TO
         run_job "$job_name"
+        echo "[encode] completed job: ${job_name}"
         job_count=$((job_count + 1))
     done
     [[ "$job_count" -gt 0 ]] || echo "[encode] JOBS is empty; configure at least one job"
