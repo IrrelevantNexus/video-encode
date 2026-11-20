@@ -9,6 +9,9 @@ WORK_DIR="${WORK_DIR:-/var/tmp/video-encode-work}"
 LOCK_FILE="${LOCK_FILE:-/var/tmp/video-encode.lock}"
 
 HW_ACCEL_ORDER="${HW_ACCEL_ORDER:-nvenc,qsv,software}"
+NVENC_GPU_IDS="${NVENC_GPU_IDS:-}"        # comma-separated FFmpeg NVENC GPU indices; empty = automatic
+MAX_CONCURRENT_ENCODES="${MAX_CONCURRENT_ENCODES:-1}"
+QSV_WORKERS="${QSV_WORKERS:-0}"          # additional concurrent Intel iGPU/QSV encodes
 CRF="${CRF:-20}"                        # software libx265 quality (lower = better/larger, 18-24 typical)
 PRESET="${PRESET:-medium}"              # software libx265 preset
 NVENC_CQ="${NVENC_CQ:-23}"              # nvenc constant quality
@@ -38,6 +41,34 @@ DYNAMIC_AFFINITY="${DYNAMIC_AFFINITY:-true}"
 MIN_ENCODE_CORES="${MIN_ENCODE_CORES:-2}"
 MAX_ENCODE_CORES="${MAX_ENCODE_CORES:-}"   # empty = no cap beyond the cores available to the container
 
+if [[ ! "$MAX_CONCURRENT_ENCODES" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[encode] ERROR: MAX_CONCURRENT_ENCODES must be a positive integer"
+    exit 1
+fi
+if [[ ! "$QSV_WORKERS" =~ ^[0-9]+$ ]]; then
+    echo "[encode] ERROR: QSV_WORKERS must be a non-negative integer"
+    exit 1
+fi
+
+declare -a NVENC_GPU_ID_ARRAY=()
+declare -A NVENC_GPU_NAME_CACHE=()
+if [[ -n "$NVENC_GPU_IDS" ]]; then
+    NVENC_GPU_IDS="${NVENC_GPU_IDS//[[:space:]]/}"
+    if [[ ! "$NVENC_GPU_IDS" =~ ^(0|[1-9][0-9]*)(,(0|[1-9][0-9]*))*$ ]]; then
+        echo "[encode] ERROR: NVENC_GPU_IDS must be comma-separated non-negative GPU indices"
+        exit 1
+    fi
+    IFS=',' read -ra NVENC_GPU_ID_ARRAY <<< "$NVENC_GPU_IDS"
+    local_seen_gpu_ids=" "
+    for gpu_id in "${NVENC_GPU_ID_ARRAY[@]}"; do
+        if [[ "$local_seen_gpu_ids" == *" $gpu_id "* ]]; then
+            echo "[encode] ERROR: duplicate GPU index in NVENC_GPU_IDS: $gpu_id"
+            exit 1
+        fi
+        local_seen_gpu_ids+="${gpu_id} "
+    done
+fi
+
 mkdir -p "$WORK_DIR"
 
 # Persists across scan cycles for the lifetime of the container (reset on container restart).
@@ -46,8 +77,11 @@ CONVERSION_COUNT_FILE="$WORK_DIR/conversions_count"
 
 bump_conversion_count() {
     local total
-    total=$(( $(cat "$CONVERSION_COUNT_FILE") + 1 ))
-    echo "$total" > "$CONVERSION_COUNT_FILE"
+    {
+        flock -x 8
+        total=$(( $(cat "$CONVERSION_COUNT_FILE") + 1 ))
+        echo "$total" > "$CONVERSION_COUNT_FILE"
+    } 8>"$CONVERSION_COUNT_FILE.lock"
     echo "[encode] conversions completed this container run: $total"
 }
 
@@ -191,9 +225,22 @@ build_video_args() {
     esac
 }
 
+get_gpu_name() {
+    local gpu_id="$1" name
+    [[ -n "$gpu_id" ]] || gpu_id="0"
+    if [[ -n "${NVENC_GPU_NAME_CACHE[$gpu_id]+x}" ]]; then
+        printf '%s' "${NVENC_GPU_NAME_CACHE[$gpu_id]}"
+        return
+    fi
+    name=$(nvidia-smi --query-gpu=index,name --format=csv,noheader 2>/dev/null |
+        awk -F', ' -v wanted="$gpu_id" '$1 == wanted { sub(/^[[:space:]]+/, "", $2); print $2; exit }')
+    NVENC_GPU_NAME_CACHE[$gpu_id]=$name
+    printf '%s' "$name"
+}
+
 encode_with_fallback() {
-    local label="$1" src_duration="$2" output_path="$3" recovery_mode="${4:-false}"
-    shift 4
+    local label="$1" src_duration="$2" output_path="$3" recovery_mode="${4:-false}" gpu_id="${5:-}"
+    shift 5
     local encoder video_args
     local -a common_args video_arg_array
     common_args=("$@")
@@ -202,16 +249,39 @@ encode_with_fallback() {
         encoder="${encoder//[[:space:]]/}"
         video_args=$(build_video_args "$encoder")
         read -ra video_arg_array <<< "$video_args"
-        if [[ "$recovery_mode" == "true" ]]; then
-            echo "[encode] trying ${encoder} with decode-error tolerance: ${label}"
-        else
-            echo "[encode] trying ${encoder}: ${label}"
+        local gpu_label=""
+        local gpu_description=""
+        local progress_gpu_id=""
+        local progress_gpu_name=""
+        if [[ "$encoder" == "nvenc" && -n "$gpu_id" ]]; then
+            video_arg_array+=(-gpu "$gpu_id")
+            progress_gpu_id="$gpu_id"
+            progress_gpu_name=$(get_gpu_name "$gpu_id")
+            gpu_description="GPU ${gpu_id}"
+            [[ -n "$progress_gpu_name" ]] && gpu_description+=" (${progress_gpu_name})"
+            gpu_label=" on ${gpu_description}"
+        elif [[ "$encoder" == "nvenc" ]]; then
+            progress_gpu_id="0"
+            progress_gpu_name=$(get_gpu_name "0")
+            gpu_description="GPU 0"
+            [[ -n "$progress_gpu_name" ]] && gpu_description+=" (${progress_gpu_name})"
+            gpu_label=" on ${gpu_description}"
+        elif [[ "$encoder" == "qsv" && "${QSV_WORKER:-false}" == "true" ]]; then
+            progress_gpu_id="iGPU"
+            progress_gpu_name="Intel Quick Sync"
+            gpu_description="Intel iGPU (QSV)"
+            gpu_label=" on ${gpu_description}"
         fi
-        if run_ffmpeg_with_progress "$label ($encoder)" "$src_duration" "${common_args[@]}" "${video_arg_array[@]}" -f matroska "$output_path"; then
-            echo "[encode] encoder selected: ${encoder}"
+        if [[ "$recovery_mode" == "true" ]]; then
+            echo "[encode] trying ${encoder}${gpu_label} with decode-error tolerance: ${label}"
+        else
+            echo "[encode] trying ${encoder}${gpu_label}: ${label}"
+        fi
+        if run_ffmpeg_with_progress "$label ($encoder)" "$src_duration" "$progress_gpu_id" "$progress_gpu_name" "${common_args[@]}" "${video_arg_array[@]}" -f matroska "$output_path"; then
+            echo "[encode] encoder selected: ${encoder}${gpu_label}"
             return 0
         fi
-        echo "[encode] ${encoder} failed, trying next encoder"
+        echo "[encode] ${encoder}${gpu_label} failed for ${label}, trying next encoder"
     done
     return 1
 }
@@ -291,8 +361,8 @@ DECODE_ERROR_PATTERN='Invalid data found when processing input|Invalid NAL unit 
 # parsed from its machine-readable -progress output, since -loglevel warning hides ffmpeg's own stats.
 # Sets FFMPEG_SOURCE_HAD_DECODE_ERRORS=true when the source's own stream data looked corrupted.
 run_ffmpeg_with_progress() {
-    local label="$1" src_duration="$2"
-    shift 2
+    local label="$1" src_duration="$2" gpu_id="$3" gpu_name="$4"
+    shift 4
     local progress_file stderr_log
     progress_file=$(mktemp "$WORK_DIR/progress.XXXXXX")
     stderr_log=$(mktemp "$WORK_DIR/ffmpeg-stderr.XXXXXX")
@@ -325,7 +395,15 @@ run_ffmpeg_with_progress() {
             if [[ -n "$speed" && "$speed" != "0x" && "$speed" =~ ^[0-9.]+x$ ]]; then
                 eta=$(awk -v t="$out_time_us" -v d="$src_duration" -v s="${speed%x}" 'BEGIN{ remaining=d-(t/1000000); if (s>0 && remaining>0) printf "%.0fs", remaining/s; else print "n/a" }')
             fi
-            echo "[encode] progress: $label ${percent}% fps=${fps:-0} speed=${speed:-n/a} eta=${eta}"
+            if [[ "$gpu_id" == "iGPU" ]]; then
+                echo "[encode] Intel iGPU (QSV) progress: $label ${percent}% fps=${fps:-0} speed=${speed:-n/a} eta=${eta}"
+            elif [[ -n "$gpu_id" ]]; then
+                gpu_description="GPU ${gpu_id}"
+                [[ -n "$gpu_name" ]] && gpu_description+=" (${gpu_name})"
+                echo "[encode] ${gpu_description} progress: $label ${percent}% fps=${fps:-0} speed=${speed:-n/a} eta=${eta}"
+            else
+                echo "[encode] progress: $label ${percent}% fps=${fps:-0} speed=${speed:-n/a} eta=${eta}"
+            fi
         done
     fi
 
@@ -372,7 +450,12 @@ remove_empty_source_dirs() {
 }
 
 process_file() {
-    local input="$1"
+    local input="$1" gpu_id="${2:-}" accelerator="${3:-}"
+    local QSV_WORKER=false
+    if [[ "$accelerator" == "qsv" ]]; then
+        QSV_WORKER=true
+        HW_ACCEL_ORDER="qsv,software"
+    fi
     local rel_path rel_dir base_name out_dir final_output tmp_output migration_state
     rel_path="${input#"$INPUT_DIR"/}"
     rel_dir=$(dirname "$rel_path")
@@ -445,7 +528,17 @@ process_file() {
         cp -f "$input" "$final_output" || return 1
     else
         mkdir -p "$out_dir"
-        echo "[encode] encoding (fallback order: ${HW_ACCEL_ORDER}): $input -> $final_output"
+        if [[ "$accelerator" == "qsv" ]]; then
+            echo "[encode] encoding with Intel iGPU (QSV) selected (fallback order: ${HW_ACCEL_ORDER}): $input -> $final_output"
+        elif [[ -n "$gpu_id" ]]; then
+            local gpu_name gpu_description
+            gpu_name=$(get_gpu_name "$gpu_id")
+            gpu_description="GPU ${gpu_id}"
+            [[ -n "$gpu_name" ]] && gpu_description+=" (${gpu_name})"
+            echo "[encode] encoding with NVENC ${gpu_description} selected (fallback order: ${HW_ACCEL_ORDER}): $input -> $final_output"
+        else
+            echo "[encode] encoding (fallback order: ${HW_ACCEL_ORDER}): $input -> $final_output"
+        fi
         compute_affinity
 
         local src_duration_precheck
@@ -464,9 +557,9 @@ process_file() {
         ffmpeg_recovery_args=(-y -hide_banner -loglevel warning -err_detect ignore_err -i "$input" \
             -map 0:v:0 -map "0:a?" -map "0:s?" )
         FFMPEG_SOURCE_HAD_DECODE_ERRORS=false
-        if ! encode_with_fallback "$base_name" "$src_duration_precheck" "$tmp_output" false "${ffmpeg_common_args[@]}"; then
+        if ! encode_with_fallback "$base_name" "$src_duration_precheck" "$tmp_output" false "$gpu_id" "${ffmpeg_common_args[@]}"; then
             echo "[encode] retrying with decode-error tolerance for damaged input: $input"
-            if ! encode_with_fallback "$base_name" "$src_duration_precheck" "$tmp_output" true "${ffmpeg_recovery_args[@]}"; then
+            if ! encode_with_fallback "$base_name" "$src_duration_precheck" "$tmp_output" true "$gpu_id" "${ffmpeg_recovery_args[@]}"; then
                 echo "[encode] ERROR: ffmpeg failed for $input"
                 rm -f "$tmp_output"
                 return 1
@@ -579,17 +672,63 @@ run_job() {
         echo "[encode] job ${job_name}: no files found to process"
     else
         echo "[encode] job ${job_name}: found ${#queue[@]} file(s) queued for encoding"
-        for f in "${queue[@]}"; do
-            process_file "$f" || echo "[encode] failed processing: $f"
+        local -a accelerator_slots=()
+        if (( ${#NVENC_GPU_ID_ARRAY[@]} > 0 )); then
+            for gpu_id in "${NVENC_GPU_ID_ARRAY[@]}"; do
+                accelerator_slots+=("nvenc:$gpu_id")
+            done
+        elif [[ ",$HW_ACCEL_ORDER," == *,nvenc,* ]]; then
+            accelerator_slots+=("nvenc:")
+        fi
+        for (( worker=0; worker<QSV_WORKERS; worker++)); do
+            accelerator_slots+=("qsv:")
         done
+        (( ${#accelerator_slots[@]} == 0 )) && accelerator_slots+=("default:")
+
+        local worker_count="$MAX_CONCURRENT_ENCODES"
+        if (( worker_count > ${#accelerator_slots[@]} )); then
+            worker_count=${#accelerator_slots[@]}
+        fi
+        (( worker_count > ${#queue[@]} )) && worker_count=${#queue[@]}
+        if (( worker_count == 1 )); then
+            local slot="${accelerator_slots[0]}"
+            local accelerator="${slot%%:*}"
+            local gpu_id="${slot#*:}"
+            [[ "$gpu_id" == "$slot" ]] && gpu_id=""
+            for f in "${queue[@]}"; do
+                process_file "$f" "$gpu_id" "$accelerator" || echo "[encode] failed processing: $f"
+            done
+        else
+            echo "[encode] job ${job_name}: running ${worker_count} concurrent encode(s)"
+            local worker queue_index gpu_id accelerator slot
+            local -a worker_pids=()
+            for (( worker=0; worker<worker_count; worker++ )); do
+                slot="${accelerator_slots[$worker]}"
+                accelerator="${slot%%:*}"
+                gpu_id="${slot#*:}"
+                [[ "$gpu_id" == "$slot" ]] && gpu_id=""
+                (
+                    for (( queue_index=worker; queue_index<${#queue[@]}; queue_index+=worker_count )); do
+                        process_file "${queue[queue_index]}" "$gpu_id" "$accelerator" ||
+                            echo "[encode] failed processing: ${queue[queue_index]}"
+                    done
+                ) &
+                worker_pids+=("$!")
+            done
+            for worker in "${worker_pids[@]}"; do
+                wait "$worker" || echo "[encode] ERROR: encode worker exited with an error"
+            done
+        fi
     fi
 }
 
 run_configured_jobs() {
     local job job_name job_input job_output job_section plex_input plex_output
     local job_count=0
-    IFS=';' read -ra configured_jobs <<< "$JOBS"
+    IFS=';' read -r -d '' -a configured_jobs < <(printf '%s\0' "$JOBS")
     for job in "${configured_jobs[@]}"; do
+        job="${job#"${job%%[![:space:]]*}"}"
+        job="${job%"${job##*[![:space:]]}"}"
         [[ -n "$job" ]] || continue
         IFS='|' read -r job_name job_input job_output job_section plex_input plex_output <<< "$job"
         if [[ -z "$job_name" || -z "$job_input" || -z "$job_output" || -z "$job_section" || -z "$plex_input" || -z "$plex_output" ]]; then

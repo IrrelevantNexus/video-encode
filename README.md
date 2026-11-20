@@ -57,14 +57,17 @@ name|container_input|container_output|plex_section_id|plex_input_path|plex_outpu
 Example:
 
 ```text
-JOBS=TV|/mnt/Video/TV-Shows/Original|/mnt/Video/TV-Shows/Production|2|/share/Video/TV-Shows/Original|/share/Video/TV-Shows/Production;Movies|/mnt/Video/Movies/Original|/mnt/Video/Movies/Production|1|/share/Video/Movies/Original|/share/Video/Movies/Production
+JOBS='TV|/mnt/Video/TV-Shows/Original|/mnt/Video/TV-Shows/Production|2|/share/Video/TV-Shows/Original|/share/Video/TV-Shows/Production;
+Movies|/mnt/Video/Movies/Original|/mnt/Video/Movies/Production|1|/share/Video/Movies/Original|/share/Video/Movies/Production'
 ```
 
 The `MEDIA_ROOT_HOST_DIR` mount must contain every container input/output path. Jobs run
 sequentially: each job's scan and queued files finish before the next job starts. Keep all
-jobs in the same `JOBS` value, separated by semicolons. The job name is only a log label, so
-distinct names (for example, `ZS-Original` and `ZS-Production`) make the logs easier to
-follow but are not required for execution.
+jobs in the same `JOBS` value, separated by semicolons. In `.env`, use single quotes for a
+multiline value as shown; backslash line continuation is not supported there. Leading and
+trailing whitespace around each job is ignored. The job name is only a log label, so distinct
+names (for example, `ZS-Original` and `ZS-Production`) make the logs easier to follow but are
+not required for execution.
 
 ## Important: Plex ratings/watched-status caveat
 
@@ -99,6 +102,9 @@ Copy `.env.example` to `.env` and adjust. Key variables:
 | Variable | Default | Notes |
 |---|---|---|
 | `HW_ACCEL_ORDER` | `nvenc,qsv,software` | comma-separated fallback order for each file |
+| `NVENC_GPU_IDS` | — | comma-separated FFmpeg NVENC GPU indices visible in the container, e.g. `0,1`; empty lets FFmpeg choose |
+| `MAX_CONCURRENT_ENCODES` | `1` | maximum files encoded concurrently; also capped by available NVENC and configured QSV slots |
+| `QSV_WORKERS` | `0` | additional concurrent Intel iGPU/QSV encode workers |
 | `CRF` | `20` | libx265 quality (software mode), lower = better/larger |
 | `PRESET` | `medium` | libx265 speed/efficiency tradeoff |
 | `NVENC_CQ` / `NVENC_PRESET` | `23` / `p5` | NVENC quality/preset |
@@ -129,8 +135,17 @@ Finding your `PLEX_TOKEN`: see Plex's docs on "Finding an authentication token".
 
 - **NVENC** is attempted first by default. Install `nvidia-container-toolkit` on the host;
   the GPU reservation is active in [docker-compose.yml](docker-compose.yml).
+- Set `NVENC_GPU_IDS` to select the FFmpeg-visible GPU indices, and set
+  `MAX_CONCURRENT_ENCODES` to control how many files run at once. For example,
+  `NVENC_GPU_IDS=0,1` and `MAX_CONCURRENT_ENCODES=2` runs at most one file on each GPU.
+  A single value (such as `NVENC_GPU_IDS=1`) selects one card. Indices refer to devices
+  visible inside the container, not necessarily host-wide `nvidia-smi` numbering. If NVENC
+  fails, the existing QSV/software fallback order still applies.
 - **QSV** is attempted second by default through the active `/dev/dri` passthrough. The
   image includes `intel-media-va-driver-non-free`.
+- To encode on two NVIDIA cards and the Intel iGPU simultaneously, set
+  `NVENC_GPU_IDS=0,1`, `MAX_CONCURRENT_ENCODES=3`, and `QSV_WORKERS=1`. The iGPU worker
+  is restricted to QSV then software fallback and is logged as `Intel iGPU (QSV)`.
 - Software libx265 is the final fallback and provides the best quality/compression, but is
   slowest. Change `HW_ACCEL_ORDER` to alter the order.
 
